@@ -8,7 +8,6 @@ from serial import Serial, SerialException
 from time import sleep
 from configparser import ConfigParser
 from os import _exit, path, getcwd, urandom
-from colorama import Fore
 from win32api import GetAsyncKeyState,GetLongPathName
 from threading import Lock, Thread
 from hwid import get_hwid
@@ -982,6 +981,17 @@ def send_discord_webhook(action_value, color):
     webhook_url = "https://auth-a6s.pages.dev/webhook"
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
+    try:
+       get_hwid()
+    except Exception as e:
+        messagebox.showerror("Failed to retrieve system info!",
+                        "Please enable WMIC:\n"
+                        "1. Open Windows Settings\n"
+                        "2. Go to System > Optional features\n"
+                        "3. Click 'View features'\n"
+                        "4. Search for 'WMIC'\n"
+                        "5. Check and install it\n"
+                        "6. Restart Loader")
     embed = {
         "title": "Loader Logs",
         "color": color,
