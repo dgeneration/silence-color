@@ -15,3 +15,11 @@ Steps For Compiling
 
 4. Passthrough VM Protect
 
+Development Mode 
+
+1. Python 3.13.2
+2. .venv
+
+Problem Solution
+
+1. if it stuck on "Initializing security systems..." add WMIC from settings > system > optional features > view features > WMIC
