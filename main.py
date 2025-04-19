@@ -2,7 +2,6 @@ from ctypes import windll
 import cv2
 from mss import mss
 import numpy as np
-from keyboard import is_pressed
 import serial.tools.list_ports
 from serial import Serial, SerialException
 from time import sleep
@@ -30,6 +29,20 @@ import sys
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import base64
 import json
+import pythoncom
+import win32com.client
+
+def get_hwid():
+    try:
+        pythoncom.CoInitialize()
+        wmi = win32com.client.Dispatch("WbemScripting.SWbemLocator")
+        service = wmi.ConnectServer(".", "root\\cimv2")
+        items = service.ExecQuery("Select * from Win32_ComputerSystemProduct")
+        for item in items:
+            return item.UUID.upper()
+    except Exception as e:
+        return f"Error: {e}"
+
 
 def get_resource_path(relative_path):
     base_paths = []
@@ -226,6 +239,7 @@ app = 'silence-color'
 session_token = None
 auth_server = "https://auth-a6s.pages.dev/check"
 auth_check = "https://auth-a6s.pages.dev/renew-session"
+auth_clear = "https://auth-a6s.pages.dev/clear-session"
 auth_headers = {
     "Content-Type": "application/json",
     "X-Encrypted": "true"
@@ -344,8 +358,8 @@ def load_config():
         lower = np.array([144, 72, 150])
         upper = np.array([152, 255, 255])
     elif color == 'anti astra':
-        lower = np.array([135, 95, 200])
-        upper = np.array([155, 255, 255])
+        lower = np.array([140, 86, 172])
+        upper = np.array([150, 255, 255])
     elif color == 'red':
         lower = np.array([0, 170, 150])
         upper = np.array([5, 255, 255])
@@ -426,33 +440,49 @@ def run_aim_assist():
                 aim_offset_x = global_config['aim_offset_x']
 
             if aim_assist_enabled:
-                aim_mid = aim_fov / 2
-                aim_ass = sct.monitors[1]
+                zoom_factor = 2.0  # Digital zoom factor
+                aim_mid = (aim_fov * zoom_factor) / 2
+                screen = sct.monitors[1]
                 aim_ass_screen = {
-                    'left': int((aim_ass['width'] / 2) - (aim_fov / 2)),
-                    'top': int((aim_ass['height'] / 2) - (aim_fov / 2)),
+                    'left': int((screen['width'] / 2) - (aim_fov / 2)),
+                    'top': int((screen['height'] / 2) - (aim_fov / 2)),
                     'width': aim_fov,
                     'height': aim_fov,
                 }
 
                 if aim_key == 'auto' or GetAsyncKeyState(aim_key) < 0:
                     img = np.array(sct.grab(aim_ass_screen))
+
+                    # Resize (zoom-in)
+                    img = cv2.resize(img, None, fx=zoom_factor, fy=zoom_factor, interpolation=cv2.INTER_LINEAR)
+
+                    # Convert and mask
                     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
                     mask = cv2.inRange(hsv, lower, upper)
+
+                    # Morphological processing
                     kernel = np.ones((3, 3), np.uint8)
-                    dilated = cv2.dilate(mask, kernel, iterations=5)
-                    thresh = cv2.threshold(dilated, 60, 255, cv2.THRESH_BINARY)[1]
+                    dilated = cv2.dilate(mask, kernel, iterations=3)
+                    blurred = cv2.GaussianBlur(dilated, (5, 5), 0)
+                    thresh = cv2.threshold(blurred, 60, 255, cv2.THRESH_BINARY)[1]
+
                     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-                    
+
                     if contours:
                         M = cv2.moments(thresh)
-                        cX = int(M["m10"] / M["m00"]) - aim_offset_x
-                        cY = int(M["m01"] / M["m00"]) - aim_offset
-                        x_offset = -(aim_mid - cX) if cX < aim_mid else cX - aim_mid
-                        y_offset = -(aim_mid - cY) if cY < aim_mid else cY - aim_mid
-                        x_move = int(round(x_offset * aim_speed_x))
-                        y_move = int(round(y_offset * aim_speed_y))
-                        mousemove_aim(arduino, x_move, y_move, message='movemouse')
+                        if M["m00"] != 0:
+                            # Adjust coordinates based on zoom
+                            cX = (int(M["m10"] / M["m00"]) / zoom_factor) - aim_offset_x
+                            cY = (int(M["m01"] / M["m00"]) / zoom_factor) - aim_offset
+
+                            x_offset = cX - (aim_fov / 2)
+                            y_offset = cY - (aim_fov / 2)
+
+                            x_move = int(round(x_offset * aim_speed_x))
+                            y_move = int(round(y_offset * aim_speed_y))
+
+                            mousemove_aim(arduino, x_move, y_move, message='movemouse')
+
             sleep(0.0035)
 
 def run_trigger_bot():
@@ -491,15 +521,7 @@ def run_trigger_bot():
 
 def key_listener():
     while True:
-        if is_pressed('f8'):
-            with config_lock:
-                global_config['aim_assist'] = not global_config['aim_assist']
-                if global_config['aim_assist']:
-                    messagebox.showinfo("Status", f"Aim Assist: ON")
-                else:
-                    messagebox.showinfo("Status", f"Aim Assist: OFF")
-            sleep(1)
-        if is_pressed('f9'):
+        if GetAsyncKeyState(0x76) < 0:
             with config_lock:
                 global_config['trigger_bot'] = not global_config['trigger_bot']
                 if global_config['trigger_bot']:
@@ -507,7 +529,15 @@ def key_listener():
                 else:
                     messagebox.showinfo("Status", f"Trigger Bot: OFF")
             sleep(1)
-        if is_pressed('F10'):
+        if GetAsyncKeyState(0x77) < 0:
+            with config_lock:
+                global_config['aim_assist'] = not global_config['aim_assist']
+                if global_config['aim_assist']:
+                    messagebox.showinfo("Status", f"Aim Assist: ON")
+                else:
+                    messagebox.showinfo("Status", f"Aim Assist: OFF")
+            sleep(1)
+        if GetAsyncKeyState(0x79) < 0:
             messagebox.showinfo("Status", f"Reloading configuration...")
             with config_lock:
                 old_arduino = global_config['arduino']
@@ -558,6 +588,40 @@ def trigger_bot_loop():
         if trigger_bot_enabled and GetAsyncKeyState(trigger_key) < 0:
             run_trigger_bot()
         sleep(0.01)
+
+def clear_session():
+        clear_data = {
+            "hwid": get_hwid(),
+            "version": version,
+            "app": app,
+        }
+
+        if session_token:
+            clear_data["sessionToken"] = session_token
+
+        try:
+            encrypted_clear = encrypt_data(clear_data)
+            response = post(auth_clear, headers=auth_headers, data=dumps(encrypted_clear), timeout=10)
+
+            # Attempt to parse JSON safely
+            try:
+                response_data = response.json()
+            except Exception as json_err:
+                raise ValueError(f"Failed to parse JSON: {json_err}")
+
+            if 'data' not in response_data or 'iv' not in response_data:
+                raise ValueError("Invalid encrypted response format")
+
+            decrypted = decrypt_response(response_data['data'], response_data['iv'])
+
+            if 'success' in decrypted:
+                _exit(0)
+                return True
+            elif 'error' in decrypted:
+                return False
+
+        except Exception as e:
+            return False
 
 def create_ui():
     root = tk.Tk()
@@ -635,6 +699,7 @@ def create_ui():
         root.after(0, root.withdraw)
 
     def exit_app(icon):
+        clear_session()
         icon.stop()
         with config_lock:
             if global_config['arduino'].is_open:
@@ -653,6 +718,7 @@ def create_ui():
     def on_drag(event):
         root.geometry(f'+{event.x_root}+{event.y_root}')
     def close_window():
+        clear_session()
         root.quit()
         root.destroy()
 
