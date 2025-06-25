@@ -11,7 +11,7 @@ from win32api import GetAsyncKeyState,GetLongPathName
 from threading import Lock, Thread
 from hwid import get_hwid
 from requests import post
-from requests import exceptions
+from requests import exceptions, get
 from json import dumps
 from datetime import datetime
 from subprocess import CREATE_NO_WINDOW , run
@@ -31,6 +31,7 @@ import base64
 import json
 import pythoncom
 import win32com.client
+from io import BytesIO
 
 def get_hwid():
     try:
@@ -42,7 +43,6 @@ def get_hwid():
             return item.UUID.upper()
     except Exception as e:
         return f"Error: {e}"
-
 
 def get_resource_path(relative_path):
     base_paths = []
@@ -62,18 +62,9 @@ def get_resource_path(relative_path):
             except ImportError:
                 pass
             except Exception as e:
-                print(f"Path conversion error: {str(e)}")
+                error = e
             return resolved
     return path.abspath(relative_path)
-
-def load_icon(window, icon_name):
-    icon_path = get_resource_path(icon_name)
-    
-    try:
-        window.iconbitmap(icon_path)
-    except tk.TclError:
-        abs_path = path.abspath(icon_path)
-        window.tk.call('wm', 'iconbitmap', window._w, f'@{abs_path}')
 
 def get_file_hash():
     try:
@@ -184,7 +175,7 @@ def detect_arduino_port():
     except Exception as e:
         raise SerialException(f"Port detection error: {str(e)}")
 
-windll.kernel32.SetConsoleTitleW("Silence Ai")
+windll.kernel32.SetConsoleTitleW("Silence Color")
 
 default_config = """
 [Settings]
@@ -213,12 +204,16 @@ aim_offset = head
 aim_speed_x = 0.6
 aim_speed_y = 0.3
 
+aim_fps = 285
+
 [Trigger]
 # Field of View for the Trigger Bot (in pixels)
 trigger_fov = 8
 
 # Trigger Delay (in milliseconds)
 trigger_delay = 0.2
+
+trigger_fps = 285
 
 [Custom]
 # Define the color ranges for detection (HSV values)
@@ -244,7 +239,28 @@ auth_headers = {
     "Content-Type": "application/json",
     "X-Encrypted": "true"
 }
+ICON_URL = "https://auth-a6s.pages.dev/images/BLACK.ico"
 
+def load_icon(window):
+    icon_image = load_icon_from_url()
+    
+    if icon_image:
+        try:
+            with BytesIO() as output:
+                icon_image.save(output, format="ICO")
+                data = output.getvalue()
+            window.iconbitmap(data)
+        except Exception as e:
+            error = e
+
+def load_icon_from_url():
+    try:
+        response = get(ICON_URL)
+        response.raise_for_status()
+        return Image.open(BytesIO(response.content))
+    except Exception as e:
+        return None
+    
 def encrypt_data(plaintext_data):
     try:
         iv = urandom(12)
@@ -320,9 +336,17 @@ def load_config():
     aim_fov = int(config['Aim']['aim_fov'])
     aim_speed_x = float(config['Aim']['aim_speed_x'])
     aim_speed_y = float(config['Aim']['aim_speed_y'])
+    aim_fps = config.getint('Aim', 'aim_fps', fallback=285)
+    if aim_fps <= 0:
+        aim_fps = 285
+    aim_sleep = 1.0 / aim_fps
 
     trigger_delay = float(config['Trigger']['trigger_delay'])
     trigger_fov = int(config['Trigger']['trigger_fov'])
+    trigger_fps = config.getint('Trigger', 'trigger_fps', fallback=285)
+    if trigger_fps <= 0:
+        trigger_fps = 285
+    trigger_sleep = 1.0 / trigger_fps
 
     aim_key_str = config['Settings']['aim_key']
     if aim_key_str.strip().lower() == 'auto':
@@ -373,11 +397,11 @@ def load_config():
     aim_assist = config.getboolean('Settings', 'aim_assist')
     trigger_bot = config.getboolean('Settings', 'trigger_bot')
 
-    return arduino, aim_fov, aim_speed_x, aim_speed_y, lower, upper, aim_assist, trigger_bot, aim_offset, aim_offset_x, aim_key, trigger_key, trigger_delay, trigger_fov,com
+    return arduino, aim_fov, aim_speed_x, aim_speed_y, lower, upper, aim_assist, trigger_bot, aim_offset, aim_offset_x, aim_key, trigger_key, trigger_delay, trigger_fov,com,aim_sleep, trigger_sleep
 
 def initialize_global_config():
     try:
-        new_arduino, aim_fov, aim_speed_x, aim_speed_y, lower, upper, aim_assist, trigger_bot, aim_offset, aim_offset_x, aim_key, trigger_key, trigger_delay, trigger_fov,com = load_config()
+        new_arduino, aim_fov, aim_speed_x, aim_speed_y, lower, upper, aim_assist, trigger_bot, aim_offset, aim_offset_x, aim_key, trigger_key, trigger_delay, trigger_fov,com,aim_sleep, trigger_sleep = load_config()
         with config_lock:
             old_arduino = global_config.get('arduino')
             if old_arduino and old_arduino.is_open:
@@ -398,7 +422,9 @@ def initialize_global_config():
                 'aim_key': aim_key,
                 'trigger_key': trigger_key,
                 'trigger_delay': trigger_delay,
-                'trigger_fov':trigger_fov
+                'trigger_fov':trigger_fov,
+                'aim_sleep': aim_sleep,
+                'trigger_sleep': trigger_sleep
             })
     except Exception as e:
         messagebox.showerror("Error", f"Error reloading config: {str(e)}")
@@ -438,10 +464,10 @@ def run_aim_assist():
                 upper = global_config['upper']
                 aim_offset = global_config['aim_offset']
                 aim_offset_x = global_config['aim_offset_x']
+                aim_sleep = global_config['aim_sleep']
 
             if aim_assist_enabled:
-                zoom_factor = 2.0  # Digital zoom factor
-                aim_mid = (aim_fov * zoom_factor) / 2
+                zoom_factor = 2.0
                 screen = sct.monitors[1]
                 aim_ass_screen = {
                     'left': int((screen['width'] / 2) - (aim_fov / 2)),
@@ -452,15 +478,9 @@ def run_aim_assist():
 
                 if aim_key == 'auto' or GetAsyncKeyState(aim_key) < 0:
                     img = np.array(sct.grab(aim_ass_screen))
-
-                    # Resize (zoom-in)
                     img = cv2.resize(img, None, fx=zoom_factor, fy=zoom_factor, interpolation=cv2.INTER_LINEAR)
-
-                    # Convert and mask
                     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
                     mask = cv2.inRange(hsv, lower, upper)
-
-                    # Morphological processing
                     kernel = np.ones((3, 3), np.uint8)
                     dilated = cv2.dilate(mask, kernel, iterations=3)
                     blurred = cv2.GaussianBlur(dilated, (5, 5), 0)
@@ -471,7 +491,6 @@ def run_aim_assist():
                     if contours:
                         M = cv2.moments(thresh)
                         if M["m00"] != 0:
-                            # Adjust coordinates based on zoom
                             cX = (int(M["m10"] / M["m00"]) / zoom_factor) - aim_offset_x
                             cY = (int(M["m01"] / M["m00"]) / zoom_factor) - aim_offset
 
@@ -483,7 +502,7 @@ def run_aim_assist():
 
                             mousemove_aim(arduino, x_move, y_move, message='movemouse')
 
-            sleep(0.0035)
+            sleep(aim_sleep)
 
 def run_trigger_bot():
    with mss() as sct:
@@ -496,6 +515,7 @@ def run_trigger_bot():
                 upper = global_config['upper']
                 trigger_fov = global_config['trigger_fov']
                 trigger_delay = global_config['trigger_delay']
+                trigger_sleep = global_config['trigger_sleep']
 
             if trigger_enabled and GetAsyncKeyState(trigger_key) < 0:
                 tig_ass = sct.monitors[1]
@@ -517,7 +537,7 @@ def run_trigger_bot():
                 if contours:
                     sleep(float(trigger_delay))
                     mousemove_aim(arduino, message="mouseclick")
-            sleep(0.0035)
+            sleep(trigger_sleep)
 
 def key_listener():
     while True:
@@ -543,7 +563,7 @@ def key_listener():
                 old_arduino = global_config['arduino']
                 if old_arduino is not None and old_arduino.is_open:
                     old_arduino.close()
-            new_arduino, aim_fov, aim_speed_x, aim_speed_y, lower, upper, aim_assist, trigger_bot, aim_offset, aim_offset_x, aim_key, trigger_key, trigger_fov, trigger_delay,com = load_config()
+            new_arduino, aim_fov, aim_speed_x, aim_speed_y, lower, upper, aim_assist, trigger_bot, aim_offset, aim_offset_x, aim_key, trigger_key, trigger_fov, trigger_delay,com, aim_sleep, trigger_sleep = load_config()
             with config_lock:
                 global_config.update({
                     'arduino': new_arduino,
@@ -560,7 +580,9 @@ def key_listener():
                     'aim_key': aim_key,
                     'trigger_key': trigger_key,
                     'trigger_delay':trigger_delay,
-                    'trigger_fov':trigger_fov
+                    'trigger_fov':trigger_fov,
+                    'aim_sleep': aim_sleep,
+                    'trigger_sleep': trigger_sleep
                 })
             messagebox.showinfo("Status", f"Configuration reloaded successfully!")
             sleep(1)
@@ -625,11 +647,11 @@ def clear_session():
 
 def create_ui():
     root = tk.Tk()
-    root.title("Silence Ai")
-    root.geometry("450x300")
+    root.title("Silence Color")
+    root.geometry("550x400")
     root.overrideredirect(True)
     root.configure(bg='black')
-    load_icon(root, 'BLACK.ico')
+    load_icon(root)
     root.attributes("-topmost", True)
     
     style = ttk.Style()
@@ -757,7 +779,8 @@ def create_ui():
     aim_offset = tk.StringVar(value=config.get('Aim', 'aim_offset'))
     aim_speed_x = tk.DoubleVar(value=config.getfloat('Aim', 'aim_speed_x'))
     aim_speed_y = tk.DoubleVar(value=config.getfloat('Aim', 'aim_speed_y'))
-
+    aim_fps_var = tk.IntVar(value=config.getint('Aim', 'aim_fps', fallback=285))
+    trigger_fps_var = tk.IntVar(value=config.getint('Trigger', 'trigger_fps', fallback=285))
     trigger_fov = tk.IntVar(value=config.getint('Trigger', 'trigger_fov'))
     trigger_delay = tk.DoubleVar(value=config.getfloat('Trigger', 'trigger_delay'))
 
@@ -849,6 +872,9 @@ def create_ui():
 
             config['Trigger']['trigger_fov'] = str(trigger_fov.get())
             config['Trigger']['trigger_delay'] = f"{trigger_delay.get():.2f}"
+            config['Aim']['aim_fps'] = str(aim_fps_var.get())
+            config['Trigger']['trigger_fps'] = str(trigger_fps_var.get())
+
 
             config['Custom']['custom_lower'] = f"{custom_lower_h.get()}, {custom_lower_s.get()}, {custom_lower_v.get()}"
             config['Custom']['custom_upper'] = f"{custom_upper_h.get()}, {custom_upper_s.get()}, {custom_upper_v.get()}"
@@ -887,6 +913,9 @@ def create_ui():
     
     ttk.Button(settings_frame, text="⚡ Spoof Arduino", command=spoof_arduino).grid(row=5, column=0, columnspan=2, pady=15, sticky='ew', padx=20)
 
+    ttk.Label(aim_frame, text="Aim FPS:").grid(row=4, column=0, padx=5, pady=2, sticky='w')
+    tk.Scale(aim_frame, from_=1, to=1000, variable=aim_fps_var, orient='horizontal').grid(row=4, column=1, padx=5, pady=2)
+    ttk.Label(aim_frame, textvariable=aim_fps_var).grid(row=4, column=2, padx=5)
     ttk.Label(aim_frame, text="Aim FOV:").grid(row=0, column=0, sticky='w', padx=5)
     tk.Scale(aim_frame, from_=0, to=200, variable=aim_fov, orient='horizontal').grid(row=0, column=1, padx=5, pady=2)
     ttk.Label(aim_frame, textvariable=aim_fov).grid(row=0, column=2, padx=5)
@@ -899,6 +928,9 @@ def create_ui():
     tk.Scale(aim_frame, from_=0.0, to=1.0, variable=aim_speed_y, resolution=0.01, orient='horizontal').grid(row=3, column=1, padx=5, pady=2)
     ttk.Label(aim_frame, textvariable=aim_speed_y).grid(row=3, column=2, padx=5)
 
+    ttk.Label(trigger_frame, text="Trigger FPS:").grid(row=2, column=0, padx=5, pady=2, sticky='w')
+    tk.Scale(trigger_frame, from_=1, to=1000, variable=trigger_fps_var, orient='horizontal').grid(row=2, column=1, padx=5, pady=2)
+    ttk.Label(trigger_frame, textvariable=trigger_fps_var).grid(row=2, column=2, padx=5)
     ttk.Label(trigger_frame, text="Trigger FOV:").grid(row=0, column=0, sticky='w', padx=5)
     tk.Scale(trigger_frame, from_=0, to=50, variable=trigger_fov, orient='horizontal').grid(row=0, column=1, padx=5, pady=2)
     ttk.Label(trigger_frame, textvariable=trigger_fov).grid(row=0, column=2, padx=5)
@@ -937,8 +969,7 @@ class LoadingScreen(tk.Tk):
         self.overrideredirect(True)
         self.attributes("-topmost", True)
         self.configure(bg='black')
-        icon_path = get_resource_path('BLACK.ico')
-        load_icon(self, icon_path)
+        load_icon(self)
         top_frame = tk.Frame(self, bg='black', relief='flat', bd=0)
         top_frame.pack(fill='x')
         close_button = tk.Button(top_frame, text="X", command=self.on_closing, fg='white', bg='black', font=('Arial', 12, 'bold'), bd=0, highlightthickness=0,cursor='hand2')
@@ -1050,14 +1081,7 @@ def send_discord_webhook(action_value, color):
     try:
        get_hwid()
     except Exception as e:
-        messagebox.showerror("Failed to retrieve system info!",
-                        "Please enable WMIC:\n"
-                        "1. Open Windows Settings\n"
-                        "2. Go to System > Optional features\n"
-                        "3. Click 'View features'\n"
-                        "4. Search for 'WMIC'\n"
-                        "5. Check and install it\n"
-                        "6. Restart Loader")
+        messagebox.showerror("Failed to retrieve system info!")
     embed = {
         "title": "Loader Logs",
         "color": color,
